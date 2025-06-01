@@ -1,8 +1,6 @@
 #include "tasksys.h"
-#include <thread>
 #include <vector>
 #include <iostream>
-#include <atomic>
 
 IRunnable::~IRunnable() {}
 
@@ -128,29 +126,70 @@ const char* TaskSystemParallelThreadPoolSpinning::name() {
     return "Parallel + Thread Pool + Spin";
 }
 
-TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int num_threads): ITaskSystem(num_threads) {
-    //
-    // TODO: CS149 student implementations may decide to perform setup
-    // operations (such as thread pool construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+static void worker_thread_spinning(std::queue<TaskSystemParallelThreadPoolSpinning::JobItem>* job_queue, std::mutex& queuelock, 
+    std::atomic<bool>* stop_flag) {
+
+    while(!stop_flag->load()) {  // keep thread alive  until destructor signals stop
+        TaskSystemParallelThreadPoolSpinning::JobItem job_item(nullptr, 0, 0, nullptr);
+        {
+            std::lock_guard<std::mutex> lock(queuelock);
+            if (!job_queue->empty()) {
+                job_item = job_queue->front();
+                job_queue->pop();
+            }
+        }
+
+        if (job_item.runnable != nullptr) {
+            job_item.runnable->runTask(job_item.current_task_id, job_item.num_total_tasks_ji);
+
+            if (job_item.completion_counter) {
+                job_item.completion_counter->fetch_sub(1, std::memory_order_relaxed);
+            }
+        } else {
+            // If no job is available, just wait, spinnning
+            std::this_thread::yield(); // Yield to allow other threads to run
+        }
+    }
 }
 
-TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {}
+TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int num_threads): ITaskSystem(num_threads), stop_flag(false) {
+    thread_pool.reserve(num_threads);
+    // create worker threads once
+    for (int i = 0; i < num_threads; ++i) {
+        thread_pool.emplace_back(worker_thread_spinning,&job_queue, std::ref(queuelock), &stop_flag);
+    }
+}
+
+TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
+    stop_flag.store(true, std::memory_order_release); // Signal threads to stop
+    for (auto& thread : thread_pool) {
+        if (thread.joinable()) {
+            thread.join(); // Wait for all threads to finish
+        }
+    }
+}
+
+
 
 void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
-
-
-    //
-    // TODO: CS149 students will modify the implementation of this
-    // method in Part A.  The implementation provided below runs all
-    // tasks sequentially on the calling thread.
-    //
+    // make a atomic couter equal to the number of tasks
+    std::atomic<int> completion_counter(num_total_tasks);
+    // also make numtasks JobItems and push them to the queue
 
     for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+        JobItem job_item(runnable, num_total_tasks, i, &completion_counter);
+        {
+            std::lock_guard<std::mutex> lock(queuelock);
+            job_queue.push(job_item);
+        }
     }
+
+    // Wait for all tasks to complete
+    while (completion_counter.load(std::memory_order_relaxed) > 0) {
+        // Spin-wait until all tasks are completed
+        std::this_thread::yield(); //spin wait
+    }
+
 }
 
 TaskID TaskSystemParallelThreadPoolSpinning::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
