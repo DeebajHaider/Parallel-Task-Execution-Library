@@ -54,22 +54,43 @@ TaskSystemParallelSpawn::TaskSystemParallelSpawn(int num_threads): ITaskSystem(n
 }
 
 TaskSystemParallelSpawn::~TaskSystemParallelSpawn() {}
-
 void TaskSystemParallelSpawn::run(IRunnable* runnable, int num_total_tasks) {
+
+    if (num_total_tasks <= 0) {    // Handle the case of no tasks.
+        return;
+    }
+
     std::vector<std::thread> all_threads;
-    all_threads.reserve(this->num_threads);
-    
     const int threads_to_use = std::min(this->num_threads, num_total_tasks);
-    const int tasks_per_thread = num_total_tasks / threads_to_use;
-    const int remaining_tasks = num_total_tasks % threads_to_use;
-    
-    for (int i = 0; i < threads_to_use; ++i) {
-        all_threads.emplace_back([runnable, num_total_tasks, tasks_per_thread, remaining_tasks, i]() {
-            const int start_idx = i * tasks_per_thread + std::min(i, remaining_tasks);
-            const int end_idx = start_idx + tasks_per_thread + (i < remaining_tasks ? 1 : 0);
-            
-            for (int task_index = start_idx; task_index < end_idx; ++task_index) {
+
+    if (threads_to_use == 0) {   // extra safety check
+        if (this->num_threads == 0 && num_total_tasks > 0) {
+            for (int task_index = 0; task_index < num_total_tasks; ++task_index) {
                 runnable->runTask(task_index, num_total_tasks);
+            }
+        }
+        return;
+    }
+
+    all_threads.reserve(threads_to_use);  // preallocate space for fast
+
+    // Using Block-Cyclic Logic Simialr to openmp dynamic chunk to distirbute uneven task 
+    const int TASK_BLOCK_SIZE = 16; // tested for multiplte power of 2, 8 seemes fine
+
+    const int num_total_task_blocks = (num_total_tasks + TASK_BLOCK_SIZE - 1) / TASK_BLOCK_SIZE;
+
+    for (int thread_id = 0; thread_id < threads_to_use; ++thread_id) {
+        all_threads.emplace_back([runnable, num_total_tasks, threads_to_use, thread_id, TASK_BLOCK_SIZE, num_total_task_blocks]() {
+            // Each thread iterates through the task blocks assigned to it
+            for (int global_block_idx = thread_id; global_block_idx < num_total_task_blocks; global_block_idx += threads_to_use) {
+                // Calculate the start and end task_id for the current block
+                int start_task_in_this_block = global_block_idx * TASK_BLOCK_SIZE;
+                int end_task_in_this_block_exclusive = std::min(start_task_in_this_block + TASK_BLOCK_SIZE, num_total_tasks);
+
+                // Process all tasks within this assigned block
+                for (int task_index = start_task_in_this_block; task_index < end_task_in_this_block_exclusive; ++task_index) {
+                    runnable->runTask(task_index, num_total_tasks);
+                }
             }
         });
     }
