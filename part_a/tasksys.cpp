@@ -50,41 +50,33 @@ const char* TaskSystemParallelSpawn::name() {
     return "Parallel + Always Spawn";
 }
 
-TaskSystemParallelSpawn::TaskSystemParallelSpawn(int num_threads): ITaskSystem(num_threads) {
-    //
-    // TODO: CS149 student implementations may decide to perform setup
-    // operations (such as thread pool construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+TaskSystemParallelSpawn::TaskSystemParallelSpawn(int num_threads): ITaskSystem(num_threads), num_threads(num_threads) { 
 }
 
 TaskSystemParallelSpawn::~TaskSystemParallelSpawn() {}
 
 void TaskSystemParallelSpawn::run(IRunnable* runnable, int num_total_tasks) {
     std::vector<std::thread> all_threads;
-
-    //
-    // TODO: CS149 students will modify the implementation of this
-    // method in Part A.  The implementation provided below runs all
-    // tasks sequentially on the calling thread.
-    //
-    int taskPerThread = 10;
-    for (int i = 0; i < num_total_tasks; i = i+ taskPerThread) {
-        all_threads.push_back(std::thread([num_total_tasks, runnable, taskPerThread](int id){
-
-            for (int j = id; j < id+taskPerThread; j = j + 1 ){
-            runnable->runTask(j, num_total_tasks);
+    all_threads.reserve(this->num_threads);
+    
+    const int threads_to_use = std::min(this->num_threads, num_total_tasks);
+    const int tasks_per_thread = num_total_tasks / threads_to_use;
+    const int remaining_tasks = num_total_tasks % threads_to_use;
+    
+    for (int i = 0; i < threads_to_use; ++i) {
+        all_threads.emplace_back([runnable, num_total_tasks, tasks_per_thread, remaining_tasks, i]() {
+            const int start_idx = i * tasks_per_thread + std::min(i, remaining_tasks);
+            const int end_idx = start_idx + tasks_per_thread + (i < remaining_tasks ? 1 : 0);
+            
+            for (int task_index = start_idx; task_index < end_idx; ++task_index) {
+                runnable->runTask(task_index, num_total_tasks);
             }
-        }, i));
+        });
     }
-
+    
     for (auto& t : all_threads) {
-        if (t.joinable()) {
-            t.join(); 
-        }
+        t.join();
     }
-
 }
 
 TaskID TaskSystemParallelSpawn::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
