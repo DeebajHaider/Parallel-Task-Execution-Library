@@ -49,7 +49,7 @@ ITaskSystem *selectTaskSystemRefImpl(int num_threads, TaskSystemType type) {
 
 int main(int argc, char** argv)
 {
-    const int n_tests = 31;
+    const int n_tests = 31 + 10;
     int num_threads = DEFAULT_NUM_THREADS;
     int num_timing_iterations = DEFAULT_NUM_TIMING_ITERATIONS;
 
@@ -83,6 +83,16 @@ int main(int argc, char** argv)
         strictGraphDepsSmall,
         strictGraphDepsMedium,
         strictGraphDepsLarge,
+        fft2dByRowsSyncTest,
+        fft2dByRowsAsyncTest,
+        fft2dByTransposeSyncTest,
+        fft2dByTransposeAsyncTest,
+        matrixTransposeSyncTest,
+        matrixTransposeAsyncTest,
+        arraySumSyncTest,
+        arraySumAsyncTest,
+        dotProductSyncTest,
+        dotProductAsyncTest
     };
 
     std::string test_names[n_tests] = {
@@ -115,6 +125,16 @@ int main(int argc, char** argv)
         "strict_graph_deps_small_async",
         "strict_graph_deps_med_async",
         "strict_graph_deps_large_async",
+        "fft2d_by_rows_sync",
+        "fft2d_by_rows_async",
+        "fft2d_by_transpose_sync",
+        "fft2d_by_transpose_async",
+        "matrix_transpose_sync",
+        "matrix_transpose_async",
+        "array_sum_sync",
+        "array_sum_async",
+        "dot_product_sync",
+        "dot_product_async"
     };
  
     // Parse commandline options

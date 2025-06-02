@@ -6,6 +6,15 @@
 #include <thread>
 #include <atomic>
 #include <set>
+#include <vector>
+#include <complex>
+#include <numeric> // For std::iota, std::accumulate
+#include <algorithm> // For std::transform, std::min, std::max
+#include <cmath>   // For M_PI, std::abs, std::sin, std::cos, std::polar
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #include "CycleTimer.h"
 #include "itasksys.h"
@@ -23,6 +32,11 @@ TestResults mathOperationsInTightForLoopFanInTest(ITaskSystem* t);
 TestResults mathOperationsInTightForLoopReductionTreeTest(ITaskSystem* t);
 TestResults spinBetweenRunCallsTest(ITaskSystem *t);
 TestResults mandelbrotChunkedTest(ITaskSystem* t);
+TestResults fft2dByTransposeSyncTest(ITaskSystem* t);
+TestResults matrixTransposeSyncTest(ITaskSystem* t);
+TestResults arraySumSyncTest(ITaskSystem* t);
+TestResults dotProductSyncTest(ITaskSystem* t);
+TestResults fft2dByRowsSyncTest(ITaskSystem* t);
 
 Async with dependencies tests
 =============================
@@ -37,6 +51,11 @@ TestResults mathOperationsInTightForLoopReductionTreeAsyncTest(ITaskSystem* t);
 TestResults spinBetweenRunCallsAsyncTest(ITaskSystem *t);
 TestResults mandelbrotChunkedAsyncTest(ITaskSystem* t);
 TestResults simpleRunDepsTest(ITaskSystem *t);
+TestResults fft2dByRowsAsyncTest(ITaskSystem* t);
+TestResults fft2dByTransposeAsyncTest(ITaskSystem* t);
+TestResults matrixTransposeAsyncTest(ITaskSystem* t);
+TestResults arraySumAsyncTest(ITaskSystem* t);
+TestResults dotProductAsyncTest(ITaskSystem* t);
 */
 
 /*
@@ -1402,4 +1421,453 @@ TestResults strictGraphDepsMedium(ITaskSystem* t) {
 
 TestResults strictGraphDepsLarge(ITaskSystem* t) {
     return strictGraphDepsTestBase(t,1000,20000,0);
+}
+
+// Helper function for 1D FFT (Recursive Cooley-Tukey)
+// Operates in-place. Input size N must be a power of 2.
+void fft_1d_recursive(std::vector<std::complex<double>>& x) {
+    const size_t N = x.size();
+    if (N <= 1) return;
+
+    if ((N & (N - 1)) != 0) {
+        // For simplicity in this example, we'll just print an error if not power of 2
+        fprintf(stderr, "FFT size is not a power of 2. Size: %zu\n", N);
+    }
+
+
+    // Divide
+    std::vector<std::complex<double>> even(N / 2);
+    std::vector<std::complex<double>> odd(N / 2);
+    for (size_t i = 0; i < N / 2; ++i) {
+        even[i] = x[2 * i];
+        odd[i] = x[2 * i + 1];
+    }
+
+    // Conquer
+    fft_1d_recursive(even);
+    fft_1d_recursive(odd);
+
+    // Combine
+    for (size_t k = 0; k < N / 2; ++k) {
+        std::complex<double> t = std::polar(1.0, -2.0 * M_PI * k / N) * odd[k];
+        x[k] = even[k] + t;
+        x[k + N / 2] = even[k] - t;
+    }
+}
+
+// Helper function for comparing complex vectors (for verification)
+bool compare_complex_vectors(const std::vector<std::complex<double>>& v1, const std::vector<std::complex<double>>& v2, double tolerance = 1e-7) {
+    if (v1.size() != v2.size()) return false;
+    for (size_t i = 0; i < v1.size(); ++i) {
+        if (std::abs(v1[i].real() - v2[i].real()) > tolerance || std::abs(v1[i].imag() - v2[i].imag()) > tolerance) {
+            printf("Verification mismatch at index %zu: v1=(%.5f, %.5f), v2=(%.5f, %.5f)\n", 
+                   i, v1[i].real(), v1[i].imag(), v2[i].real(), v2[i].imag());
+            return false;
+        }
+    }
+    return true;
+}
+
+// Helper function for comparing complex matrices (for verification)
+bool compare_complex_matrices(const std::vector<std::vector<std::complex<double>>>& m1, 
+                              const std::vector<std::vector<std::complex<double>>>& m2, 
+                              double tolerance = 1e-7) {
+    if (m1.size() != m2.size()) {
+        printf("Verification matrix row count mismatch: m1.size()=%zu, m2.size()=%zu\n", m1.size(), m2.size());
+        return false;
+    }
+    for (size_t i = 0; i < m1.size(); ++i) {
+        if (m1[i].size() != m2[i].size()) {
+             printf("Verification matrix col count mismatch for row %zu: m1[i].size()=%zu, m2[i].size()=%zu\n", i, m1[i].size(), m2[i].size());
+            return false;
+        }
+        if (!compare_complex_vectors(m1[i], m2[i], tolerance)) {
+            printf("Verification mismatch in matrix row %zu\n", i);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Helper for serial 2D FFT (for verification)
+void fft_2d_serial(std::vector<std::vector<std::complex<double>>>& matrix) {
+    int R = matrix.size();
+    if (R == 0) return;
+    int C = matrix[0].size();
+
+    // FFT on all rows
+    for (int i = 0; i < R; ++i) {
+        fft_1d_recursive(matrix[i]);
+    }
+
+    // Transpose
+    std::vector<std::vector<std::complex<double>>> temp_matrix(C, std::vector<std::complex<double>>(R));
+    for (int i = 0; i < R; ++i) {
+        for (int j = 0; j < C; ++j) {
+            temp_matrix[j][i] = matrix[i][j];
+        }
+    }
+
+    // FFT on rows of transposed matrix (effectively columns of original)
+    for (int i = 0; i < C; ++i) {
+        fft_1d_recursive(temp_matrix[i]);
+    }
+
+    // Transpose back
+    for (int i = 0; i < C; ++i) {
+        for (int j = 0; j < R; ++j) {
+            matrix[j][i] = temp_matrix[i][j];
+        }
+    }
+}
+
+// Task for 1D FFT on rows of a matrix
+class OneDFFTRowTask : public IRunnable {
+public:
+    std::vector<std::vector<std::complex<double>>>* matrix_ptr_;
+    int num_total_rows_; // Total rows in the matrix this task might operate on
+
+    OneDFFTRowTask(std::vector<std::vector<std::complex<double>>>* matrix)
+        : matrix_ptr_(matrix) {
+        num_total_rows_ = matrix ? matrix->size() : 0;
+    }
+
+    void runTask(int task_id, int num_overall_tasks) override {
+        int rows_per_task_instance = (num_total_rows_ + num_overall_tasks - 1) / num_overall_tasks;
+        int start_row = task_id * rows_per_task_instance;
+        int end_row = std::min(start_row + rows_per_task_instance, num_total_rows_);
+
+        for (int r = start_row; r < end_row; ++r) {
+            if (r < num_total_rows_) { // Ensure row index is valid
+                 fft_1d_recursive((*matrix_ptr_)[r]);
+            }
+        }
+    }
+};
+
+// Task for Matrix Transpose (Templated for different data types)
+template<typename T>
+class MatrixTransposeTaskT : public IRunnable {
+public:
+    const std::vector<std::vector<T>>* src_matrix_;
+    std::vector<std::vector<T>>* dst_matrix_; // Must be pre-sized to C_src x R_src
+    int R_src_, C_src_;
+
+    MatrixTransposeTaskT(const std::vector<std::vector<T>>* src,
+                         std::vector<std::vector<T>>* dst,
+                         int R, int C) // R, C are dimensions of src
+        : src_matrix_(src), dst_matrix_(dst), R_src_(R), C_src_(C) {}
+
+    void runTask(int task_id, int num_total_tasks) override {
+        // Each task transposes a block of rows from source to columns in destination
+        int rows_per_task_instance = (R_src_ + num_total_tasks - 1) / num_total_tasks;
+        int start_row_src = task_id * rows_per_task_instance;
+        int end_row_src = std::min(start_row_src + rows_per_task_instance, R_src_);
+
+        for (int i = start_row_src; i < end_row_src; ++i) {
+            for (int j = 0; j < C_src_; ++j) {
+                (*dst_matrix_)[j][i] = (*src_matrix_)[i][j];
+            }
+        }
+    }
+};
+
+// Task for Array Sum (calculates partial sum for a chunk)
+class ArraySumChunkTask : public IRunnable {
+public:
+    const double* array_ptr_;
+    int total_elements_;
+    double* partial_sums_ptr_; // Array to store partial sums, indexed by task_id
+
+    ArraySumChunkTask(const double* array, int N, double* partial_sums)
+        : array_ptr_(array), total_elements_(N), partial_sums_ptr_(partial_sums) {}
+
+    void runTask(int task_id, int num_total_tasks) override {
+        int elements_per_task = (total_elements_ + num_total_tasks - 1) / num_total_tasks;
+        int start_el = task_id * elements_per_task;
+        int end_el = std::min(start_el + elements_per_task, total_elements_);
+
+        double sum = 0.0;
+        for (int i = start_el; i < end_el; ++i) {
+            sum += array_ptr_[i];
+        }
+        partial_sums_ptr_[task_id] = sum;
+    }
+};
+
+// Task for Dot Product (calculates partial dot product for a chunk)
+class DotProductChunkTask : public IRunnable {
+public:
+    const double* vec_a_ptr_;
+    const double* vec_b_ptr_;
+    int total_elements_;
+    double* partial_dots_ptr_; // Array to store partial dot products
+
+    DotProductChunkTask(const double* vec_a, const double* vec_b, int N, double* partial_dots)
+        : vec_a_ptr_(vec_a), vec_b_ptr_(vec_b), total_elements_(N), partial_dots_ptr_(partial_dots) {}
+
+    void runTask(int task_id, int num_total_tasks) override {
+        int elements_per_task = (total_elements_ + num_total_tasks - 1) / num_total_tasks;
+        int start_el = task_id * elements_per_task;
+        int end_el = std::min(start_el + elements_per_task, total_elements_);
+
+        double dot_sum = 0.0;
+        for (int i = start_el; i < end_el; ++i) {
+            dot_sum += vec_a_ptr_[i] * vec_b_ptr_[i];
+        }
+        partial_dots_ptr_[task_id] = dot_sum;
+    }
+};
+
+// --- 2D FFT by Rows Only Test ---
+TestResults fft2dByRows_Impl(ITaskSystem* t, bool do_async, int N_dim, int num_fft_tasks) {
+    // N_dim must be a power of 2 for fft_1d_recursive
+    std::vector<std::vector<std::complex<double>>> matrix(N_dim, std::vector<std::complex<double>>(N_dim));
+    std::vector<std::vector<std::complex<double>>> matrix_golden(N_dim, std::vector<std::complex<double>>(N_dim));
+
+    // Initialize matrices
+    for (int i = 0; i < N_dim; ++i) {
+        for (int j = 0; j < N_dim; ++j) {
+            matrix[i][j] = std::complex<double>(rand() % 100, rand() % 100);
+            matrix_golden[i][j] = matrix[i][j];
+        }
+    }
+
+    // Serial computation for golden result (row FFTs only)
+    for (int i = 0; i < N_dim; ++i) {
+        fft_1d_recursive(matrix_golden[i]);
+    }
+
+    OneDFFTRowTask fft_task_runner(&matrix);
+
+    double start_time = CycleTimer::currentSeconds();
+    if (do_async) {
+        t->runAsyncWithDeps(&fft_task_runner, num_fft_tasks, {});
+        t->sync();
+    } else {
+        t->run(&fft_task_runner, num_fft_tasks);
+    }
+    double end_time = CycleTimer::currentSeconds();
+
+    TestResults results;
+    results.passed = compare_complex_matrices(matrix, matrix_golden);
+    if (!results.passed) printf("ERROR: fft2dByRows_Impl correctness check FAILED!\n");
+    results.time = end_time - start_time;
+    return results;
+}
+
+TestResults fft2dByRowsSyncTest(ITaskSystem* t) {
+    return fft2dByRows_Impl(t, false, 1024, 1024); // 512x512 matrix, 512 tasks (1 per row)
+}
+TestResults fft2dByRowsAsyncTest(ITaskSystem* t) {
+    return fft2dByRows_Impl(t, true, 1024, 1024);
+}
+
+
+// --- 2D FFT using Transpose Test (Full 2D FFT) ---
+TestResults fft2dByTranspose_Impl(ITaskSystem* t, bool do_async, int N_dim, int num_tasks_per_stage) {
+    // N_dim must be a power of 2
+    std::vector<std::vector<std::complex<double>>> matrix(N_dim, std::vector<std::complex<double>>(N_dim));
+    std::vector<std::vector<std::complex<double>>> matrix_golden(N_dim, std::vector<std::complex<double>>(N_dim));
+    
+    // Intermediate matrices for the transpose method
+    std::vector<std::vector<std::complex<double>>> M1 = matrix; // For row FFTs
+    std::vector<std::vector<std::complex<double>>> M2(N_dim, std::vector<std::complex<double>>(N_dim)); // For first transpose
+    std::vector<std::vector<std::complex<double>>> M3 = M2; // For col FFTs (as row FFTs on transposed)
+    std::vector<std::vector<std::complex<double>>> M_output(N_dim, std::vector<std::complex<double>>(N_dim)); // For final transpose
+
+    // Initialize
+    for (int i = 0; i < N_dim; ++i) {
+        for (int j = 0; j < N_dim; ++j) {
+            M1[i][j] = std::complex<double>(rand() % 100 - 50, rand() % 100 - 50);
+            matrix_golden[i][j] = M1[i][j];
+        }
+    }
+
+    // Serial computation for golden result (full 2D FFT)
+    fft_2d_serial(matrix_golden);
+    
+    OneDFFTRowTask row_fft_runner(&M1);
+    MatrixTransposeTaskT<std::complex<double>> transpose1_runner(&M1, &M2, N_dim, N_dim);
+    OneDFFTRowTask col_fft_runner(&M2); // Operates on M2 (which is M1 transposed)
+    MatrixTransposeTaskT<std::complex<double>> transpose2_runner(&M2, &M_output, N_dim, N_dim);
+
+
+    double start_time = CycleTimer::currentSeconds();
+    if (do_async) {
+        TaskID task_id_row_fft = t->runAsyncWithDeps(&row_fft_runner, num_tasks_per_stage, {});
+        
+        std::vector<TaskID> dep_transpose1 = {task_id_row_fft};
+        TaskID task_id_transpose1 = t->runAsyncWithDeps(&transpose1_runner, num_tasks_per_stage, dep_transpose1);
+        
+        std::vector<TaskID> dep_col_fft = {task_id_transpose1};
+        TaskID task_id_col_fft = t->runAsyncWithDeps(&col_fft_runner, num_tasks_per_stage, dep_col_fft);
+        
+        std::vector<TaskID> dep_transpose2 = {task_id_col_fft};
+        /* TaskID task_id_transpose2 = */ t->runAsyncWithDeps(&transpose2_runner, num_tasks_per_stage, dep_transpose2);
+        
+        t->sync();
+    } else {
+        t->run(&row_fft_runner, num_tasks_per_stage);       // M1 gets row FFTs
+        t->run(&transpose1_runner, num_tasks_per_stage);   // M1 transposed into M2
+        t->run(&col_fft_runner, num_tasks_per_stage);      // M2 gets "row" FFTs (cols of M1)
+        t->run(&transpose2_runner, num_tasks_per_stage);   // M2 transposed into M_output
+    }
+    double end_time = CycleTimer::currentSeconds();
+
+    TestResults results;
+    results.passed = compare_complex_matrices(M_output, matrix_golden);
+     if (!results.passed) printf("ERROR: fft2dByTranspose_Impl correctness check FAILED!\n");
+    results.time = end_time - start_time;
+    return results;
+}
+
+TestResults fft2dByTransposeSyncTest(ITaskSystem* t) {
+    return fft2dByTranspose_Impl(t, false, 512, 64); 
+}
+TestResults fft2dByTransposeAsyncTest(ITaskSystem* t) {
+    return fft2dByTranspose_Impl(t, true, 512, 64); 
+}
+
+// --- Matrix Transpose Test (double) ---
+TestResults matrixTranspose_Impl(ITaskSystem* t, bool do_async, int R, int C, int num_transpose_tasks) {
+    std::vector<std::vector<double>> matrix_src(R, std::vector<double>(C));
+    std::vector<std::vector<double>> matrix_dst(C, std::vector<double>(R)); // Transposed dimensions
+    std::vector<std::vector<double>> matrix_golden(C, std::vector<double>(R));
+
+    for (int i = 0; i < R; ++i) {
+        for (int j = 0; j < C; ++j) {
+            matrix_src[i][j] = static_cast<double>(i * C + j);
+        }
+    }
+
+    // Serial computation for golden result
+    for (int i = 0; i < R; ++i) {
+        for (int j = 0; j < C; ++j) {
+            matrix_golden[j][i] = matrix_src[i][j];
+        }
+    }
+
+    MatrixTransposeTaskT<double> transpose_runner(&matrix_src, &matrix_dst, R, C);
+
+    double start_time = CycleTimer::currentSeconds();
+    if (do_async) {
+        t->runAsyncWithDeps(&transpose_runner, num_transpose_tasks, {});
+        t->sync();
+    } else {
+        t->run(&transpose_runner, num_transpose_tasks);
+    }
+    double end_time = CycleTimer::currentSeconds();
+
+    TestResults results;
+    results.passed = true;
+    for(int i=0; i<C; ++i) {
+        for(int j=0; j<R; ++j) {
+            if (std::abs(matrix_dst[i][j] - matrix_golden[i][j]) > 1e-9) {
+                results.passed = false; 
+                printf("Verification mismatch matrixTranspose_Impl at dst[%d][%d]: %.5f vs %.5f\n", i,j, matrix_dst[i][j], matrix_golden[i][j]);
+                goto end_transpose_check; 
+            }
+        }
+    }
+    end_transpose_check:;
+    if (!results.passed) printf("ERROR: matrixTranspose_Impl correctness check FAILED!\n");
+    results.time = end_time - start_time;
+    return results;
+}
+TestResults matrixTransposeSyncTest(ITaskSystem* t) {
+    return matrixTranspose_Impl(t, false, 2048, 4096, 128);
+}
+TestResults matrixTransposeAsyncTest(ITaskSystem* t) {
+    return matrixTranspose_Impl(t, true, 2048, 4096, 128);
+}
+
+// --- Array Sum Test ---
+TestResults arraySum_Impl(ITaskSystem* t, bool do_async, int array_size, int num_sum_tasks) {
+    std::vector<double> array_data(array_size);
+    for (int i = 0; i < array_size; ++i) {
+        array_data[i] = static_cast<double>(rand() % 10);
+    }
+
+    double golden_sum = 0.0;
+    for (int i = 0; i < array_size; ++i) {
+        golden_sum += array_data[i];
+    }
+
+    std::vector<double> partial_sums(num_sum_tasks, 0.0);
+    ArraySumChunkTask sum_task_runner(array_data.data(), array_size, partial_sums.data());
+
+    double start_time = CycleTimer::currentSeconds();
+    if (do_async) {
+        t->runAsyncWithDeps(&sum_task_runner, num_sum_tasks, {});
+        t->sync();
+    } else {
+        t->run(&sum_task_runner, num_sum_tasks);
+    }
+    double end_time = CycleTimer::currentSeconds();
+
+    double parallel_sum = 0.0;
+    for (int i = 0; i < num_sum_tasks; ++i) {
+        parallel_sum += partial_sums[i];
+    }
+    
+    TestResults results;
+    results.passed = (std::abs(parallel_sum - golden_sum) < 1e-7 * std::abs(golden_sum) || std::abs(parallel_sum - golden_sum) < 1e-9);
+    if (!results.passed) {
+         printf("ERROR: arraySum_Impl correctness check FAILED! Parallel: %.5f, Golden: %.5f\n", parallel_sum, golden_sum);
+    }
+    results.time = end_time - start_time;
+    return results;
+}
+TestResults arraySumSyncTest(ITaskSystem* t) {
+    return arraySum_Impl(t, false, 80 * 1024 * 1024, 256);
+}
+TestResults arraySumAsyncTest(ITaskSystem* t) {
+    return arraySum_Impl(t, true, 80 * 1024 * 1024, 256);
+}
+
+// --- Dot Product Test ---
+TestResults dotProduct_Impl(ITaskSystem* t, bool do_async, int vec_size, int num_dot_tasks) {
+    std::vector<double> vec_a(vec_size);
+    std::vector<double> vec_b(vec_size);
+    for (int i = 0; i < vec_size; ++i) {
+        vec_a[i] = static_cast<double>(rand() % 5);
+        vec_b[i] = static_cast<double>(rand() % 5);
+    }
+
+    double golden_dot_product = 0.0;
+    for (int i = 0; i < vec_size; ++i) {
+        golden_dot_product += vec_a[i] * vec_b[i];
+    }
+
+    std::vector<double> partial_dots(num_dot_tasks, 0.0);
+    DotProductChunkTask dot_task_runner(vec_a.data(), vec_b.data(), vec_size, partial_dots.data());
+
+    double start_time = CycleTimer::currentSeconds();
+    if (do_async) {
+        t->runAsyncWithDeps(&dot_task_runner, num_dot_tasks, {});
+        t->sync();
+    } else {
+        t->run(&dot_task_runner, num_dot_tasks);
+    }
+    double end_time = CycleTimer::currentSeconds();
+
+    double parallel_dot_product = 0.0;
+    for (int i = 0; i < num_dot_tasks; ++i) {
+        parallel_dot_product += partial_dots[i];
+    }
+
+    TestResults results;
+    results.passed = (std::abs(parallel_dot_product - golden_dot_product) < 1e-7 * std::abs(golden_dot_product) || std::abs(parallel_dot_product - golden_dot_product) < 1e-9);
+     if (!results.passed) {
+         printf("ERROR: dotProduct_Impl correctness check FAILED! Parallel: %.5f, Golden: %.5f\n", parallel_dot_product, golden_dot_product);
+    }
+    results.time = end_time - start_time;
+    return results;
+}
+TestResults dotProductSyncTest(ITaskSystem* t) {
+    return dotProduct_Impl(t, false, 80 * 1024 * 1024, 256);
+}
+TestResults dotProductAsyncTest(ITaskSystem* t) {
+    return dotProduct_Impl(t, true, 80 * 1024 * 1024, 256);
 }
