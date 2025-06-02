@@ -1,8 +1,30 @@
 
 # Assignment 2: Building A Task Execution Library from the Ground Up #
 
-# Done by Abdul Wasay Imran and Syed Muhammad Deebaj Haider Kazmi# 
+## 👥 **Meet the Team**
 
+<div align="center">
+<table>
+<tr>
+<td align="center" width="50%">
+<div>
+<img src="1.jpg" width="120px" height="120px" style="border-radius: 50%; border: 4px solid #6366f1; object-fit: cover;" alt="Abdul Wasay Imran"/>
+<h2><b>Abdul Wasay Imran</b></h2>
+<h3><b>ERP: 27126</b></h3>
+<br/>
+</div>
+</td>
+<td align="center" width="50%">
+<div>
+<img src="2.png" width="120px" height="120px" style="border-radius: 50%; border: 4px solid #6366f1; object-fit: cover;" alt="Syed Muhammad Deebaj Haider Kazmi"/>
+<h2><b>Syed Muhammad Deebaj Haider Kazmi</b></h2>
+<h3><b>ERP: 26012</b></h3>
+<br/>
+</div>
+</td>
+</tr>
+</table>
+</div>
 
 
 ## Overview ##
