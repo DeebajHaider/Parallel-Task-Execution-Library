@@ -213,35 +213,84 @@ const char* TaskSystemParallelThreadPoolSleeping::name() {
     return "Parallel + Thread Pool + Sleep";
 }
 
-TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads): ITaskSystem(num_threads) {
-    //
-    // TODO: CS149 student implementations may decide to perform setup
-    // operations (such as thread pool construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+static void worker_thread_sleeping(std::queue<TaskSystemParallelThreadPoolSleeping::JobItemSleep>* job_queue, std::mutex& queuelock,
+    std::atomic<bool>* stop_flag, std::condition_variable& task_available_cv) {
+
+    TaskSystemParallelThreadPoolSleeping::JobItemSleep job_item(nullptr, 0, 0, nullptr);
+
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lock(queuelock);
+            task_available_cv.wait(lock, [&] {
+                return !job_queue->empty() || stop_flag->load(std::memory_order_acquire);
+            });
+
+            // After wait, check stop_flag first. If stopping and queue is empty, exit.
+            if (stop_flag->load(std::memory_order_acquire)) {
+                if (job_queue->empty()) {
+                    return; 
+                }
+            }
+
+            if (!job_queue->empty()) {
+                job_item = job_queue->front();
+                job_queue->pop();
+            } else {
+                // This case should ideally only be hit if stop_flag was true and queue was empty
+                // (handled by `return` above), or it was a spurious wakeup with an empty queue
+                // and stop_flag false (in which case, we sleep and wait again).
+                continue;
+            }
+        }
+
+        if (job_item.runnable != nullptr) {
+            job_item.runnable->runTask(job_item.current_task_id, job_item.num_total_tasks_ji);
+
+            if (job_item.completion_counter) {
+                if (job_item.completion_counter->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+               // add code for run sleep later
+                }
+            }
+        } else if (stop_flag->load(std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads): ITaskSystem(num_threads), stop_flag(false) {
+    thread_pool.reserve(num_threads);
+    // create worker threads once
+    for (int i = 0; i < num_threads; ++i) {
+        thread_pool.emplace_back(worker_thread_sleeping,&job_queue, std::ref(queuelock), &stop_flag, std::ref(task_available_cv));
+    }
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
-    //
-    // TODO: CS149 student implementations may decide to perform cleanup
-    // operations (such as thread pool shutdown construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+    stop_flag.store(true, std::memory_order_release); // Signal threads to stop
+    task_available_cv.notify_all(); // Notify all threads to wake up and check the stop flag
+    for (auto& thread : thread_pool) {
+        if (thread.joinable()) {
+            thread.join(); // Wait for all threads to finish
+        }
+    }
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
+    if (num_total_tasks <= 0) return; // Handle empty task set
 
-
-    //
-    // TODO: CS149 students will modify the implementation of this
-    // method in Parts A and B.  The implementation provided below runs all
-    // tasks sequentially on the calling thread.
-    //
+    std::atomic<int> completion_counter(num_total_tasks);
 
     for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+        JobItemSleep job_item_to_queue(runnable, num_total_tasks, i, &completion_counter);
+        {
+            std::lock_guard<std::mutex> lock(queuelock);
+            job_queue.push(job_item_to_queue);
+        }
+    }
+        task_available_cv.notify_all();
+
+    while (completion_counter.load(std::memory_order_acquire) > 0){
+
     }
 }
 
