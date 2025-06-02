@@ -1,7 +1,7 @@
 
-# Assignment 2: Building A Task Execution Library from the Ground Up #
+# PARALLEL AND DISTRIBUTED COMPUTING PROJECT: TASK EXECUTION LIBRARY #
 
-## 👥 **Meet the Team**
+## Team Members
 
 <div align="center">
 <table>
@@ -26,335 +26,160 @@
 </table>
 </div>
 
+## Instructor
+- Dr. Muhammad Saeed
+- Shayan Shamsi (Teacher Assistant)
 
-## Overview ##
 
-Everyone likes to complete tasks quickly, and in this assignment we are asking you to do just that! You will implement a C++ library that executes tasks provided by an application as efficiently as possible on a multi-core CPU.
+## Overview
+This project implements a C++ library for efficient parallel task execution on multi-core CPUs. The library supports two main modes of operation:
+1.  **Synchronous Bulk Task Launch (Part A):** Executes a given number of instances of the same task in parallel, with the `run()` call blocking until all instances complete.
+2.  **Asynchronous Task Graph Execution (Part B):** Executes complex task graphs where tasks can have dependencies on others. Tasks are launched asynchronously via `runAsyncWithDeps()`, and a `sync()` call ensures all previously launched tasks are complete.
 
-In the first part of the assignment, you will implement a version of the task execution library that supports bulk (data-parallel) launch of many instances of the same task. This functionality is similar to the [ISPC task launch behavior](http://ispc.github.io/ispc.html#task-parallelism-launch-and-sync-statements) you used to parallelize code across cores in Assignment 1.
+The goal was to explore different parallelization strategies, understand their trade-offs, and optimize for performance using thread pools and synchronization primitives.
 
-In the second part of the assignment, you will extend your task runtime system to execute more complex _task graphs_, where the execution of tasks may depend on the results produced by other tasks. These dependencies constrain which tasks can be safely run in parallel by your task scheduling system.  Scheduling execution of data-parallel task graphs on a parallel machine is a feature of many popular parallel runtime systems ranging from the popular [Thread Building Blocks](https://github.com/intel/tbb) library, to [Apache Spark](https://spark.apache.org/), to modern deep learning frameworks such as [PyTorch](https://pytorch.org/) and [TensorFlow](https://www.tensorflow.org/).
+## Part A: Synchronous Bulk Task Launch Implementations
 
-This assignment will require you to:
+We implemented three parallel versions for synchronous bulk task launches, in addition to the provided serial baseline:
 
-* Manage task execution using a thread pool
-* Orchestrate worker thread execution using synchronization primitives such as mutexes and condition variables
-* Implement a task scheduler that reflects dependencies defined by a task graph
-* Understand workload characteristics to make efficient task scheduling decisions
+### 1. `TaskSystemParallelSpawn`
+*   **Concept:** For each call to `run()`, this system spawns a new set of worker threads (up to the configured `num_threads`).
+*   **Implementation Details:**
+    *   A `std::vector<std::thread>` is created within the `run()` method.
+    *   Tasks are distributed dynamically among these worker threads using a shared `std::atomic<int> next_task_id_atomic` to ensure each task instance (from 0 to `num_total_tasks - 1`) is processed exactly once. Each thread fetches and increments this atomic counter to claim a task ID.
+    *   The main thread waits for all spawned worker threads to complete using `thread.join()` before `run()` returns.
+*   **Trade-offs:**
+    *   Pros: Simple to implement synchronous behavior; isolates thread management to each `run()` call.
+    *   Cons: High overhead due to repeated thread creation and destruction, especially for frequent calls to `run()` or short-lived tasks.
 
-### Wait, I Think I've Done This Before? ###
+### 2. `TaskSystemParallelThreadPoolSpinning`
+*   **Concept:** A fixed-size pool of worker threads is created once during system construction. These threads continuously spin, checking a shared job queue for tasks.
+*   **Implementation Details:**
+    *   Worker threads are created in the constructor and stored in `std::vector<std::thread> thread_pool`.
+    *   A `std::queue<JobItem> job_queue` stores individual task instances. `JobItem` includes the `IRunnable*`, task ID, total tasks, and a pointer to a shared `std::atomic<int> completion_counter` for the bulk launch.
+    *   Access to `job_queue` is protected by `std::mutex queuelock`.
+    *   Worker threads loop, acquiring the lock, checking if the queue is non-empty, and popping a job if available. If the queue is empty, they `std::this_thread::yield()` and retry (spin-wait).
+    *   The `run()` method enqueues all `num_total_tasks` as `JobItem`s. It then spin-waits (using `std::this_thread::yield()`) on the `completion_counter` until it reaches zero.
+    *   A `std::atomic<bool> stop_flag` is used to signal worker threads to terminate during destruction.
+*   **Trade-offs:**
+    *   Pros: Reduces thread creation overhead significantly compared to `TaskSystemParallelSpawn`.
+    *   Cons: Worker threads and the main thread consume CPU cycles while spin-waiting, which can be wasteful if no tasks are available or if workers are waiting for tasks that the main thread is trying to submit.
 
-You may have already created thread pools and task execution libraries in classes such as CS107 or CS111.
-However, the current assignment is a unique opportunity to better understand these systems.
-You will implement multiple task execution libraries, some without thread pools and some with different types of thread pools.
-By implementing multiple task scheduling strategies and comparing their performance on difference workloads, you will better understand the implications of key design choices when creating a parallel system.
+### 3. `TaskSystemParallelThreadPoolSleeping`
+*   **Concept:** Similar to the spinning thread pool, but worker threads sleep when no work is available, and the main thread sleeps while waiting for task completion, reducing CPU wastage.
+*   **Implementation Details:**
+    *   Introduces `std::condition_variable task_available_cv` for worker threads to wait on when the `job_queue` is empty.
+    *   Worker threads:
+        *   Acquire `queuelock`.
+        *   Wait on `task_available_cv` using `cv.wait(lock, [&]{ return !job_queue.empty() || stop_flag.load(); });`.
+        *   If woken and `job_queue` has tasks, they pop and execute.
+        *   After executing a task, they decrement the `completion_counter`. If it becomes zero, they notify `all_done_cv`.
+    *   The `run()` method:
+        *   Enqueues all `num_total_tasks` as `JobItemSleep`s. Each `JobItemSleep` now also carries pointers to a bulk-launch-specific `std::condition_variable all_done_cv` and `std::mutex all_done_mutex`.
+        *   Notifies worker threads via `task_available_cv.notify_all()` after enqueuing jobs.
+        *   Waits on `all_done_cv` until the `completion_counter` (for that specific bulk launch) reaches zero.
+    *   `stop_flag` and `task_available_cv.notify_all()` are used in the destructor to cleanly shut down worker threads.
+*   **Trade-offs:**
+    *   Pros: Maximizes CPU efficiency by putting idle threads to sleep. Reduces contention if the main thread was previously spinning.
+    *   Cons: Slightly more complex due to condition variable management. Potential for minor overhead from context switching if tasks are extremely short and arrive very rapidly.
 
-## Environment Setup ##
+## Part B: Asynchronous Task Graph Execution (`TaskSystemParallelThreadPoolSleeping`)
 
-**We will be grading this assignment on an Amazon AWS `c7g.4xlarge` instance - we provide instructions for setting up your VM [here](https://github.com/stanford-cs149/asst2/blob/master/cloud_readme.md). Please ensure your code works on this VM as we will be using this for performance testing and grading.**
+The `TaskSystemParallelThreadPoolSleeping` class was extended to support asynchronous task launches with dependencies.
 
-The assignment starter code is available on [Github](https://github.com/stanford-cs149/asst2). Please download the Assignment 2 starter code at:
+### Key Concepts & Data Structures:
+*   **`TaskID`**: A unique identifier for each bulk task launch, generated by `_next_bulk_task_id_counter`.
+*   **`SubTask`**: Represents a single instance of a task within a bulk launch. Stored in `_ready_sub_task_queue`. Fields: `IRunnable*`, `task_idx`, `total_tasks_in_bulk`, `bulk_task_id`.
+*   **`BulkTaskNode`**: Represents a bulk task launch in the dependency graph. Stored in `std::map<TaskID, BulkTaskNode> _task_graph_nodes`. Key fields:
+    *   `id`: The `TaskID` of this bulk launch.
+    *   `runnable_ptr`: The `IRunnable` object for this bulk task.
+    *   `num_total_sub_tasks`: Total sub-tasks in this bulk launch.
+    *   `remaining_sub_tasks_count` (atomic): Number of sub-tasks not yet completed by workers for this bulk task.
+    *   `unsatisfied_dependencies_count` (atomic): Number of prerequisite bulk tasks that have not yet completed.
+    *   `successor_bulk_task_ids`: A `std::vector<TaskID>` of bulk tasks that depend on this one.
+    *   `sub_tasks_scheduled`: A boolean flag to prevent scheduling sub-tasks multiple times.
+*   **`_ready_sub_task_queue` (std::queue<SubTask>)**: A queue of individual sub-tasks that are ready to be executed by worker threads. Protected by `_ready_queue_mutex` and signaled by `_ready_queue_cv`.
+*   **`_task_graph_nodes` (std::map<TaskID, BulkTaskNode>)**: Stores all bulk task nodes, representing the task graph. Protected by `_task_graph_mutex`.
+*   **`_active_bulk_tasks_count` (atomic)**: Counts the number of bulk tasks that have been submitted via `runAsyncWithDeps` but have not yet fully completed (all their sub-tasks finished and their completion processed). Used by `sync()`.
+*   **`_sync_op_cv` and `_sync_op_mutex`**: Used by the `sync()` method to wait until `_active_bulk_tasks_count` becomes zero.
 
-    https://github.com/stanford-cs149/asst2/archive/refs/heads/master.zip
+### Workflow:
+1.  **`runAsyncWithDeps(runnable, num_total_tasks, deps)`**:
+    *   Generates a new unique `TaskID`.
+    *   Increments `_active_bulk_tasks_count`.
+    *   Creates a `BulkTaskNode` for this new bulk launch.
+    *   Populates its `unsatisfied_dependencies_count` by checking the status (`remaining_sub_tasks_count > 0`) of each `TaskID` in the `deps` vector. For each unsatisfied dependency, it adds the new `TaskID` to the dependency's `successor_bulk_task_ids` list.
+    *   If `unsatisfied_dependencies_count` is 0 and `num_total_tasks > 0`:
+        *   The bulk task is ready. Its individual sub-tasks (as `SubTask` objects) are enqueued into `_ready_sub_task_queue`.
+        *   `_ready_queue_cv` is notified.
+        *   The `sub_tasks_scheduled` flag in the `BulkTaskNode` is set.
+    *   If `unsatisfied_dependencies_count` is 0 and `num_total_tasks == 0`:
+        *   The 0-task bulk launch is immediately "completed". `handle_bulk_task_completion()` is called for it.
+    *   Returns the new `TaskID`.
 
-**IMPORTANT:** DO NOT modify the provided `Makefile`. Doing so may break our grading script.
+2.  **Worker Thread Loop (`worker_thread_loop`)**:
+    *   Waits on `_ready_queue_cv` until `_ready_sub_task_queue` is not empty or the system is being killed.
+    *   Dequeues a `SubTask`.
+    *   Executes `sub_task.runnable->runTask(...)`.
+    *   Atomically decrements `remaining_sub_tasks_count` for the `BulkTaskNode` corresponding to `sub_task.bulk_task_id`.
+    *   If `remaining_sub_tasks_count` for that bulk task becomes 0, it calls `handle_bulk_task_completion(sub_task.bulk_task_id)`.
 
-## Part A: Synchronous Bulk Task Launch
+3.  **`handle_bulk_task_completion(completed_bulk_id)`**:
+    *   This function is called when all sub-tasks of `completed_bulk_id` are done.
+    *   It iterates through `successor_bulk_task_ids` of the completed bulk task.
+    *   For each successor:
+        *   Atomically decrements its `unsatisfied_dependencies_count`.
+        *   If a successor's `unsatisfied_dependencies_count` becomes 0:
+            *   If it has `num_total_sub_tasks > 0` and `!sub_tasks_scheduled`: Its sub-tasks are enqueued to `_ready_sub_task_queue`, `_ready_queue_cv` is notified, and `sub_tasks_scheduled` is set.
+            *   If it has `num_total_sub_tasks == 0`: It's a 0-task bulk launch whose dependencies are now met. Recursively call `handle_bulk_task_completion()` for this successor.
+    *   Atomically decrements `_active_bulk_tasks_count`.
+    *   If `_active_bulk_tasks_count` becomes 0, it notifies `_sync_op_cv`.
 
-In Assignment 1, you used ISPC's task launch primitive to launch N instances of an ISPC task (`launch[N] myISPCFunction()`).  In the first part of this assignment, you will implement similar functionality in your task execution library.
+4.  **`sync()`**:
+    *   Waits on `_sync_op_cv` until `_active_bulk_tasks_count` becomes 0.
 
-To get started, get acquainted with the definition of `ITaskSystem` in `itasksys.h`. This [abstract class](https://www.tutorialspoint.com/cplusplus/cpp_interfaces.htm) defines the interface to your task execution system.  The interface features a method `run()`, which has the following signature:
+5.  **`run(runnable, num_total_tasks)` (for Part B context)**:
+    *   Implemented by calling `runAsyncWithDeps(runnable, num_total_tasks, {})` followed by `sync()`.
 
-    virtual void run(IRunnable* runnable, int num_total_tasks) = 0;
+## Custom Tests
+We developed the following custom tests to evaluate correctness and performance on diverse workloads:
+1.  **`fft2dByRows` (Sync/Async):** Computes 2D FFT by performing 1D FFTs on all rows of a matrix. Tests parallelization of independent row operations. Each task handles a subset of rows.
+2.  **`fft2dByTranspose` (Sync/Async):** Computes full 2D FFT using the transpose method: Row FFTs -> Transpose -> "Row" FFTs (on columns) -> Transpose. Tests a pipeline of dependent bulk launches in the async version.
+3.  **`matrixTranspose` (Sync/Async):** Transposes a large matrix. Each task transposes a block of rows from the source to columns in the destination.
+4.  **`arraySum` (Sync/Async):** Computes the sum of elements in a large array. Tasks compute partial sums for chunks of the array, which are then aggregated.
+5.  **`dotProduct` (Sync/Async):** Computes the dot product of two large vectors. Tasks compute partial dot products for chunks.
 
-`run()` executes `num_total_tasks` instances of the specified task.  Since this single function call results in the execution of many tasks, we refer to each call to `run()` as a _bulk task launch_.
+These tests cover scenarios with:
+*   Independent tasks (e.g., row FFTs, initial stages of sum/dot product).
+*   Dependent task stages (e.g., full 2D FFT by transpose).
+*   Varying computational intensity and data access patterns.
 
-The starter code in `tasksys.cpp` contains a correct, but serial, implementation of `TaskSystemSerial::run()` which serves as an example of how the task system uses the `IRunnable` interface to execute a bulk task launch. (The definition of `IRunnable` is in `itasksys.h`) Notice how in each call to `IRunnable::runTask()` the task system provides the task a current task identifier (an integer between 0 and `num_total_tasks`), as well as the total number of tasks in the bulk task launch.  The task's implementation will use these parameters to determine what work the task should do.
+## Performance Observations
 
-One important detail of `run()` is that it must execute tasks synchronously with respect to the calling thread.  In other words, when the call to `run()` returns, the application is guaranteed that the task system has completed execution of ****all tasks**** in the bulk task launch.  The serial implementation of `run()` provided in the starter code executes all tasks on the calling thread and thus meets this requirement.
+### Part A (Synchronous Bulk Launch)
+*   **`TaskSystemSerial`**: Serves as the baseline. Performance scales linearly with `num_total_tasks`.
+*   **`TaskSystemParallelSpawn`**: Shows speedup over serial due to parallelism. However, for tests with many small/fast bulk launches (e.g., `super_super_light`), the overhead of thread creation/joining per `run()` call can make it slower than thread pool implementations or even approach serial times if tasks are extremely light. For our custom tests with fewer, larger bulk launches, it performs better than serial but generally worse than thread pool versions.
+*   **`TaskSystemParallelThreadPoolSpinning`**: Significantly outperforms `ParallelSpawn` on tests with frequent, short tasks by avoiding thread creation overhead. It shows good speedups on most workloads. Its performance can be slightly better than `ThreadPoolSleeping` for very rapid task dispatches where CV overhead might be noticeable, but can be worse if threads spin wastefully.
+*   **`TaskSystemParallelThreadPoolSleeping`**: Generally the most robust performer. It matches or slightly trails `ThreadPoolSpinning` when tasks are abundant and rapidly processed, but excels when there are lulls in task availability or when not all cores are utilized by tasks (e.g., `spin_between_run_calls`), as it avoids wasteful CPU spinning. Our custom tests show it providing strong, consistent speedups.
 
-### Running Tests ###
+**Example for `fft2d_by_rows_sync` (1024x1024 matrix, 10 cores):**
+*   Serial: ~106 ms
+*   Spawn: ~32 ms
+*   Spin: ~21 ms
+*   Sleep: ~24 ms
+This shows the thread pool advantage, with Spin slightly edging out Sleep likely due to the continuous stream of row tasks.
 
-The starter code contains a suite of test applications that use your task system. For a description of the test harness tests, see `tests/README.md`, and for the test definitions themselves, see `tests/tests.h`. To run a test, use the `runtasks` script. For example, to run the test called `mandelbrot_chunked`, which computes an image of a Mandelbrot fractal using a bulk launch of tasks that each process a continuous chunk of the image, type:
+### Part B (Asynchronous Task Graph Execution - `ThreadPoolSleeping`)
+*   The `ThreadPoolSleeping` implementation with dependency management shows significant speedups for asynchronous workloads, especially those with inherent parallelism that can be exposed by the task graph (e.g., the transpose-based 2D FFT).
+*   **`fft2dByTransposeAsync` (512x512 matrix, 10 cores):**
+    *   Serial (simulated async): ~48 ms
+    *   ThreadPoolSleeping (Async): ~12 ms
+    This demonstrates a ~4x speedup, effectively utilizing parallelism across dependent stages.
+*   The custom tests highlight the system's ability to manage dependencies and schedule tasks efficiently, achieving good parallel speedup.
 
+## Build and Run
+The project is built using the provided `Makefile`. Do not modify it.
+To run tests:
 ```bash
-./runtasks -n 16 mandelbrot_chunked
-```
-
-
-The different tests have different performance characteristics -- some do little work per task, others perform significant amounts of processing.  Some tests create large numbers of tasks per launch, others very few.  Sometimes the tasks in a launch all have similar compute cost.  In others, the cost of tasks in a single bulk launch is variable. We have described most of the tests in `tests/README.md`, but we encourage you to inspect the code in `tests/tests.h` to understand the behavior of all tests in more detail.
-
-One test that may be helpful to debug correctness while implementing your solution is `simple_test_sync`, which is a very small test that should not be used to measure performance but is small enough to be debuggable with print statements or debugger. See function `simpleTest` in `tests/tests.h`.
-
-We encourage you to create your own tests. Take a look at the existing tests in `tests/tests.h` for inspiration. We have also included a skeleton test composed of `class YourTask` and function `yourTest()` for you to build on if you so choose. For the tests you do create, make sure to add them to the list of tests and test names in `tests/main.cpp`, and adjust the variable `n_tests` accordingly. Please note that while you will be able to run your own tests with your solution, you will not be able to compile the reference solution to run your tests.
-
-The `-n` command-line option specifies the maximum number of threads the task system implementation can use.  In the example above, we chose `-n 16` because the CPU in the AWS instance features sixteen execution contexts.  The full list of tests available to run is available via command line help  (`-h` command line option).
-
-The `-i` command-line options specifies the number of times to run the tests during performance measurement. To get an accurate measure of performance, `./runtasks` runs the test multiple times and records the _minimum_ runtime of several runs; In general, the default value is sufficient---Larger values might yield more accurate measurements, at the cost of greater test runtime.
-
-In addition, we also provide you the test harness that we will use for grading performance:
-
-```bash
->>> python3 ../tests/run_test_harness.py
-```
-
-The harness has the following command line arguments,
-
-```bash
->>> python3 run_test_harness.py -h
-usage: run_test_harness.py [-h] [-n NUM_THREADS]
-                           [-t TEST_NAMES [TEST_NAMES ...]] [-a]
-
-Run task system performance tests
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -n NUM_THREADS, --num_threads NUM_THREADS
-                        Max number of threads that the task system can use. (16
-                        by default)
-  -t TEST_NAMES [TEST_NAMES ...], --test_names TEST_NAMES [TEST_NAMES ...]
-                        List of tests to run
-  -a, --run_async       Run async tests
-```
-
-It produces a detailed performance report that looks like this:
-
-```bash
->>> python3 ../tests/run_test_harness.py -t super_light super_super_light
-python3 ../tests/run_test_harness.py -t super_light super_super_light
-================================================================================
-Running task system grading harness... (2 total tests)
-  - Detected CPU with 16 execution contexts
-  - Task system configured to use at most 16 threads
-================================================================================
-================================================================================
-Executing test: super_super_light...
-Reference binary: ./runtasks_ref_linux
-Results for: super_super_light
-                                        STUDENT   REFERENCE   PERF?
-[Serial]                                9.053     9.022       1.00  (OK)
-[Parallel + Always Spawn]               8.982     33.953      0.26  (OK)
-[Parallel + Thread Pool + Spin]         8.942     12.095      0.74  (OK)
-[Parallel + Thread Pool + Sleep]        8.97      8.849       1.01  (OK)
-================================================================================
-Executing test: super_light...
-Reference binary: ./runtasks_ref_linux
-Results for: super_light
-                                        STUDENT   REFERENCE   PERF?
-[Serial]                                68.525    68.03       1.01  (OK)
-[Parallel + Always Spawn]               68.178    40.677      1.68  (NOT OK)
-[Parallel + Thread Pool + Spin]         67.676    25.244      2.68  (NOT OK)
-[Parallel + Thread Pool + Sleep]        68.464    20.588      3.33  (NOT OK)
-================================================================================
-Overall performance results
-[Serial]                                : All passed Perf
-[Parallel + Always Spawn]               : Perf did not pass all tests
-[Parallel + Thread Pool + Spin]         : Perf did not pass all tests
-[Parallel + Thread Pool + Sleep]        : Perf did not pass all tests
-```
-
-In the above output `PERF` is the ratio of your implementation's runtime to the reference solution's runtime. So values less than one indicate that your task system implementation is faster than the reference implementation.
-
-> [!TIP]
-> Mac users: While we provided reference solution binaries for both part a and part b, we will be testing your code using the linux binaries. Therefore, we recommend you check your implementation in the AWS instance before submitting. If you are using a newer Mac with an M1 chip, use the `runtasks_ref_osx_arm` binary when testing locally. Otherwise, use the `runtasks_ref_osx_x86` binary.
-
-> [!IMPORTANT]
-We'll be grading your solution on AWS with `runtasks_ref_linux_arm` version of the reference solution. Please make sure your solution works correctly on the AWS ARM instance.
-
-### What You Need To Do ###
-
-Your job is to implement a task execution engine that efficiently uses your multi-core CPU. You will be graded on both the correctness of your implementation (it must run all the tasks correctly) as well as on its performance.  This should be a fun coding challenge, but it is a non-trivial piece of work. To help you stay on the right track, to complete Part A of the assignment, we will have you implement multiple versions of the task system, slowly increasing in complexity and performance of your implementation.  Your three implementations will be in the classes defined in `tasksys.cpp/.h`.
-
-* `TaskSystemParallelSpawn`
-* `TaskSystemParallelThreadPoolSpinning`
-* `TaskSystemParallelThreadPoolSleeping`
-
-__Implement your part A implementation in the `part_a/` sub-directory to compare to the correct reference implementation (`part_a/runtasks_ref_*`).__
-
-_Pro tip: Notice how the instructions below take the approach of "try the simplest improvement first". Each step increases the complexity of the task execution system's implementation, but on each step along the way you should have a working (fully correct) task runtime system._
-
-We also expect you to create at least one test, which can test either correctness or performance. See the Running Tests section above for more information.
-
-#### Step 1: Move to a Parallel Task System ####
-
-__In this step please implement the class `TaskSystemParallelSpawn`.__
-
-The starter code provides you a working serial implementation of the task system in `TaskSystemSerial`.  In this step of the assignment you will extend the starter code to execute a bulk task launch in parallel.
-
-* You will need to create additional threads of control to perform the work of a bulk task launch.  Notice that `TaskSystem`'s constructor is provided a parameter `num_threads` which is the ****maximum number of worker threads**** your implementation may use to run tasks.
-
-* In the spirit of "do the simplest thing first", we recommend that you spawn worker threads at the beginning of `run()` and join these threads from the main thread before `run()` returns.  This will be a correct implementation, but it will incur significant overhead from frequent thread creation.
-
-* How will you assign tasks to your worker threads?  Should you consider static or dynamic assignment of tasks to threads?
-
-* Are there shared variables (internal state of your task execution system) that you need to protect from simultaneous access from multiple threads?  You may wish to review our [C++ synchronization tutorial](tutorial/README.md) for more information on the synchronization primitives in the C++ standard library.
-
-#### Step 2: Avoid Frequent Thread Creation Using a Thread Pool ####
-
-__In this step please implement the class `TaskSystemParallelThreadPoolSpinning`.__
-
-Your implementation in step 1 will incur overhead due to creating threads in each call to `run()`.  This overhead is particularly noticeable when tasks are cheap to compute.  At this point, we recommend you move to a "thread pool" implementation where your task execution system creates all worker threads up front (e.g., during `TaskSystem` construction, or upon the first call to `run()`).
-
-* As a starting implementation we recommend that you design your worker threads to continuously loop, always checking if there is more work to them to perform. (A thread entering a while loop until a condition is true is typically referred to as "spinning".)  How might a worker thread determine there is work to do?
-
-* It is now non-trivial to ensure that `run()` implements the required synchronous behavior.  How do you need to change the implementation of `run()` to determine that all tasks in the bulk task launch have completed?
-
-#### Step 3: Put Threads to Sleep When There is Nothing to Do ####
-
-__In this step please implement the class `TaskSystemParallelThreadPoolSleeping`.__
-
-One of the drawbacks of the step 2 implementation is that threads utilize a CPU core's execution resources as they "spin" waiting for something to do.  For example, worker threads might loop waiting for new tasks to arrive.  As another example, the main thread might loop waiting for the worker threads to complete all tasks so it can return from a call to `run()`.  This can hurt performance since CPU resources are used to run these threads even though the threads are not doing useful work.
-
-In this part of the assignment, we want you to improve the efficiency of your task system by putting threads to sleep until the condition they are waiting for is met.
-
-* Your implementation may choose to use condition variables to implement this behavior.  Condition variables are a synchronization primitive that enables threads to sleep (and occupy no CPU processing resources) while they are waiting for a condition to exist. Other threads "signal" waiting threads to wake up to see if the condition they were waiting for has been met. For example, your worker threads could be put to sleep if there is no work to be done (so they don't take CPU resources away from threads trying to do useful work).  As another example, your main application thread that calls `run()` might want to sleep while it waits for all the tasks in a bulk task launch to be completed by the worker threads. (Otherwise a spinning main thread would take CPU resources away from the worker threads!)  Please see our [C++ synchronization tutorial](tutorial/README.md) for more information on condition variables in C++.
-
-* Your implementation in this part of the assignment may have tricky race conditions to think about.  You'll need to consider many possible interleavings of thread behavior.
-
-* You might want to consider writing additional test cases to exercise your system.  __The assignment starter code includes the workloads that the grading script will use to grade the performance of your code, but we will also test the correctness of your implementation using a wider set of workloads that we are not providing in the starter code!__
-
-## Part B: Supporting Execution of Task Graphs
-
-In part B of the assignment you will extend your part A task system implementation to support the asynchronous launch of tasks that may have dependencies on previous tasks.  These inter-task dependencies create scheduling constraints that your task execution library must respect.
-
-The `ITaskSystem` interface has an additional method:
-
-    virtual TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
-                                    const std::vector<TaskID>& deps) = 0;
-
-`runAsyncWithDeps()` is similar to `run()` in that it also is used to perform a bulk launch of `num_total_tasks` tasks. However, it differs from `run()` in a number of ways...
-
-#### Asynchronous Task Launch ####
-
-First, tasks created using `runAsyncWithDeps()` are executed by the task system _asynchronously_ with the calling thread. This means that `runAsyncWithDeps()`, should return to the caller _immediately_, even if the tasks have not completed execution. The method returns a unique identifier associated with this bulk task launch.
-
-The calling thread can determine when the bulk task launch has actually completed by calling `sync()`.
-
-    virtual void sync() = 0;
-
-`sync()` returns to the caller __only when the tasks associated with all prior bulk task launches have completed.__  For example, consider the following code:
-
-    // assume taskA and taskB are valid instances of IRunnable...
-
-    std::vector<TaskID> noDeps;  // empty vector
-
-    ITaskSystem *t = new TaskSystem(num_threads);
-
-    // bulk launch of 4 tasks
-    TaskID launchA = t->runAsyncWithDeps(taskA, 4, noDeps);
-
-    // bulk launch of 8 tasks
-    TaskID launchB = t->runAsyncWithDeps(taskB, 8, noDeps);
-
-    // at this point tasks associated with launchA and launchB
-    // may still be running
-
-    t->sync();
-
-    // at this point all 12 tasks associated with launchA and launchB
-    // are guaranteed to have terminated
-
-As described in the comments above, the calling thread is not guaranteed tasks from previous calls to `runAsyncWithDeps()` have completed until the thread calls `sync()`.  To be precise, `runAsyncWithDeps()` tells your task system to perform a new bulk task launch, but your implementation has the flexibility to execute these tasks at any time prior to the next call to `sync()`.  Note that this specification means there is no guarantee that your implementation performs tasks from launchA prior to starting tasks from launchB!
-
-#### Support for Explicit Dependencies ####
-
-The second key detail of `runAsyncWithDeps()` is its third argument: a vector of TaskID identifiers that must refer to previous bulk task launches using `runAsyncWithDeps()`.  This vector specifies what prior tasks the tasks in the current bulk task launch depend on. __Therefore, your task runtime cannot begin execution of any task in the current bulk task launch until all tasks from the launches given in the dependency vector are complete!__  For example, consider the following example:
-
-    std::vector<TaskID> noDeps;  // empty vector
-    std::vector<TaskID> depOnA;
-    std::vector<TaskID> depOnBC;
-
-    ITaskSystem *t = new TaskSystem(num_threads);
-
-    TaskID launchA = t->runAsyncWithDeps(taskA, 128, noDeps);
-    depOnA.push_back(launchA);
-
-    TaskID launchB = t->runAsyncWithDeps(taskB, 2, depOnA);
-    TaskID launchC = t->runAsyncWithDeps(taskC, 6, depOnA);
-    depOnBC.push_back(launchB);
-    depOnBC.push_back(launchC);
-
-    TaskID launchD = t->runAsyncWithDeps(taskD, 32, depOnBC);
-    t->sync();
-
-The code above features four bulk task launches (taskA: 128 tasks, taskB: 2 tasks, taskC: 6 tasks, taskD: 32 tasks).  Notice that the launch of taskB and of taskC depend on taskA. The bulk launch of taskD (`launchD`) depends on the results of both `launchB` and `launchC`.  Therefore, while your task runtime is allowed to process tasks associated with `launchB` and `launchC` in any order (including in parallel), all tasks from these launches must begin executing after the completion of tasks from `launchA`, and they must complete before your runtime can begin executing any task from `launchD`.
-
-We can illustrate these dependencies visually as a __task graph__. A task graph is a directed acyclic graph (DAG), where nodes in the graph correspond to bulk task launches, and an edge from node X to node Y indicates a dependency of Y on the output of X.  The task graph for the code above is:
-
-<p align="center">
-    <img src="figs/task_graph.png" width=400>
-</p>
-
-Notice that if you were running the example above on a Myth machine with eight execution contexts, the ability to schedule the tasks from `launchB` and `launchC` in parallel might be quite useful, since neither bulk task launch on its own is sufficient to use all the execution resources of the machine.
-
-### Testing ###
-All of the tests with postfix `Async` should be used to test part B. The subset of tests included in the grading harness are described in `tests/README.md`, and all tests can be found in `tests/tests.h` and are listed in `tests/main.cpp`. To debug correctness, we've provided a small test `simple_test_async`. Take a look at the `simpleTest` function in `tests/tests.h`. `simple_test_async` should be small enough to debug using print statements or breakpoints inside `simpleTest`.
-
-We encourage you to create your own tests. Take a look at the existing tests in `tests/tests.h` for inspiration. We have also included a skeleton test composed of `class YourTask` and function `yourTest()` for you to build on if you so choose. For the tests you do create, make sure to add them to the list of tests and test names in `tests/main.cpp`, and adjust the variable `n_tests` accordingly. Please note that while you will be able to run your own tests with your solution, you will not be able to compile the reference solution to run your tests.
-
-### What You Need to Do ###
-
-You must extend your task system implementation that uses a thread pool (and sleeps) from part A to correctly implement `TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps()` and `TaskSystemParallelThreadPoolSleeping::sync()`. We also expect you to create at least one test, which can test either correctness or performance. See the `Testing` section above for more information. As a clarification, you will *need* to describe your own tests in the writeup, but our autograder will *NOT* test your test.
-**You do not need to implement the other `TaskSystem` classes in Part B.**
-
-As with Part A, we offer you the following tips to get started:
-* It may be helpful to think about the behavior of `runAsyncWithDeps()` as pushing a record corresponding to the bulk task launch, or perhaps records corresponding to each of the tasks in the bulk task launch onto a "work queue".  Once the record to work to do is in the queue, `runAsyncWithDeps()` can return to the caller.
-
-* The trick in this part of the assignment is performing the appropriate bookkeeping to track dependencies. What must be done when all the tasks in a bulk task launch complete? (This is the point when new tasks may become available to run.)
-
-* It can be helpful to have two data structures in your implementation: (1) a structure representing tasks that have been added to the system via a call to `runAsyncWithDeps()`, but are not yet ready to execute because they depend on tasks that are still running (these tasks are "waiting" for others to finish) and (2) a "ready queue" of tasks that are not waiting on any prior tasks to finish and can safely be run as soon as a worker thread is available to process them.
-
-* You need not worry about integer wrap around when generating unique task launch ids. We will not hit your task system with over 2^31 bulk task launches.
-
-* You can assume all programs will either call only `run()` or only `runAsyncWithDeps()`; that is, you do not need to handle the case where a `run()` call needs to wait for all proceeding calls to `runAsyncWithDeps()` to finish. Note that this assumption means you can implement `run()` using appropriate calls to `runAsyncWithDeps()` and `sync()`.
-
-* You can assume the only multithreading going on is the multiple threads created by/used by your implementation. That is, we won't be spawning additional threads and calling your implementation from those threads.
-
-__Implement your part B implementation in the `part_b/` sub-directory to compare to the correct reference implementation (`part_b/runtasks_ref_*`).__
-
-## Grading ##
-
-Points in this assignment will be assigned as follows,
-
-**Part A (50 points)**
-- 5 points for correctness of `TaskSystemParallelSpawn::run()` + 5 points for its performance.  (10 points total)
-- 10 points each for correctness `TaskSystemParallelThreadPoolSpinning::run()` and `TaskSystemParallelThreadPoolSleeping::run()` + 10 points each for the performance of these methods. (40 points total)
-
-**Part B (40 points)**
-- 30 points for correctness of `TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps()`, `TaskSystemParallelThreadPoolSleeping::run()`, and `TaskSystemParallelThreadPoolSleeping::sync()`
-- 10 points for performance of `TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps()`, `TaskSystemParallelThreadPoolSleeping::run()`, and `TaskSystemParallelThreadPoolSleeping::sync()`. For part B, you can ignore results for `Parallel + Always Spawn` and `Parallel + Thread Pool + Spin`. That is, you only need to pass `Parallel + Thread Pool + Sleep` for each test case. 
-
-**Writeup (10 points)**
-- Please refer to the "Handin" section for more details.
-
-For each test, full performance points will be awarded for implementations within 20% of the provided reference implementation. Performance points are only awarded for implementations that return correct answers. As stated before, we may also test the _correctness_ of your implementation using a wider set of workloads that we are not providing in the starter code.
-
-## Handin ##
-
-Please submit your work using [Gradescope](https://www.gradescope.com/).  Your submission should include both your task system code, and a writeup describing your implementation.  We are expecting the following five files in the handin:
-
- * part_a/tasksys.cpp
- * part_a/tasksys.h
- * part_b/tasksys.cpp
- * part_b/tasksys.h
- * Your write-up PDF (submit to gradescope write-up assignment)
-
-#### Code Handin ####
-
-We ask you to submit source files `part_a/tasksys.cpp|.h` and `part_b/tasksys.cpp|.h` in a compressed file. You can create a directory (e.g named `asst2_submission`) with sub-directories `part_a` and `part_b`, drop the relevant files in, compress the directory by running `tar -czvf asst2.tar.gz asst2_submission`, and upload it. Please submit the **compressed file** `asst2.tar.gz` to assignment *Assignment 2 (Code)* on Gradescope.
-
-Before submitting the source files, make sure that all code is compilable and runnable! We should be able to drop these files into a clean starter code tree, type `make`, and then execute your program without manual intervention.
-
-Our grading scripts will run the checker code provided to you in the starter code to determine performance points.  _We will also run your code on other applications that are not provided in the starter code to further test its correctness!_ The grading script will be run *after* the assignment is due.
-
-#### Writeup Handin ####
-
-Please submit a brief writeup to the assignment *Assignment 2 (Write-up)* on Gradescope, addressing the following:
-
- 1. Describe your task system implementation (1 page is fine).  In additional to a general description of how it works, please make sure you address the following questions:
-  * How did you decide to manage threads? (e.g., did you implement a thread pool?)
-  * How does your system assign tasks to worker threads? Did you use static or dynamic assignment?
-  * How did you track dependencies in Part B to ensure correct execution of task graphs?
-
- 2. In Part A, you may have noticed that simpler task system implementations (e.g., a completely serial implementation, or the spawn threads every launch implementation), perform as well as or sometimes better than the more advanced implementations.  Please explain why this is the case, citing certain tests as examples.  For example, in what situations did the sequential task system implementation perform best? Why?  In what situations did the spawn-every-launch implementation perform as well as the more advanced parallel implementations that use a thread pool?  When does it not?
- 3. Describe one test that you implemented for this assignment. What does the test do, what is it meant to check, and how did you verify that your solution to the assignment did well on your test? Did the result of the test you added cause you to change your assignment implementation?
+./runtasks -n <num_threads> <test_name>
+# Example: ./runtasks -n 10 mandelbrot_chunked
