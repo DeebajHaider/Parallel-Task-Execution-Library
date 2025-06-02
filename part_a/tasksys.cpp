@@ -216,7 +216,7 @@ const char* TaskSystemParallelThreadPoolSleeping::name() {
 static void worker_thread_sleeping(std::queue<TaskSystemParallelThreadPoolSleeping::JobItemSleep>* job_queue, std::mutex& queuelock,
     std::atomic<bool>* stop_flag, std::condition_variable& task_available_cv) {
 
-    TaskSystemParallelThreadPoolSleeping::JobItemSleep job_item(nullptr, 0, 0, nullptr);
+    TaskSystemParallelThreadPoolSleeping::JobItemSleep job_item(nullptr, 0, 0, nullptr, nullptr, nullptr);
 
     while (true) {
         {
@@ -248,7 +248,9 @@ static void worker_thread_sleeping(std::queue<TaskSystemParallelThreadPoolSleepi
 
             if (job_item.completion_counter) {
                 if (job_item.completion_counter->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-               // add code for run sleep later
+                    // If this was the last task, notify the all_done_cv
+                    std::lock_guard<std::mutex> lock(*job_item.all_done_mutex);
+                    job_item.all_done_cv->notify_all();
                 }
             }
         } else if (stop_flag->load(std::memory_order_acquire)) {
@@ -277,20 +279,24 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
     if (num_total_tasks <= 0) return; // Handle empty task set
+    std::condition_variable all_done_cv;
+    std::mutex all_done_mutex;
 
     std::atomic<int> completion_counter(num_total_tasks);
 
     for (int i = 0; i < num_total_tasks; i++) {
-        JobItemSleep job_item_to_queue(runnable, num_total_tasks, i, &completion_counter);
+        JobItemSleep job_item_to_queue(runnable, num_total_tasks, i, &completion_counter, &all_done_cv, &all_done_mutex);
         {
             std::lock_guard<std::mutex> lock(queuelock);
             job_queue.push(job_item_to_queue);
         }
     }
-        task_available_cv.notify_all();
+    task_available_cv.notify_all();   // awake all threads after pushing all jobs. 
 
-    while (completion_counter.load(std::memory_order_acquire) > 0){
-
+    std::unique_lock<std::mutex> lock(all_done_mutex);
+    all_done_cv.wait(lock, [&] { return completion_counter.load(std::memory_order_acquire) == 0;});
+    if (completion_counter.load(std::memory_order_acquire) == 0) {
+        return; // All tasks are done
     }
 }
 

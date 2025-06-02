@@ -105,16 +105,22 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
             int num_total_tasks_ji; 
             int current_task_id;      
             std::atomic<int>* completion_counter; 
+            std::condition_variable* all_done_cv;
+            std::mutex* all_done_mutex;
 
             JobItemSleep(IRunnable* task_runnable,
                     int total_tasks_for_group,
                     int task_id_for_this_item,
-                    std::atomic<int>* counter_for_group
+                    std::atomic<int>* counter_for_group, 
+                    std::condition_variable* all_done_cv_ptr,
+                    std::mutex* all_done_mutex_ptr
                     )
                 : runnable(task_runnable),
                 num_total_tasks_ji(total_tasks_for_group),
                 current_task_id(task_id_for_this_item),
-                completion_counter(counter_for_group){
+                completion_counter(counter_for_group),
+                all_done_cv(all_done_cv_ptr),
+                all_done_mutex(all_done_mutex_ptr) {
             }
         };
 
